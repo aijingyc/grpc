@@ -16,12 +16,15 @@
  *
  */
 
+#include <cstdio>
 #include <memory>
 #include <iostream>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <grpcpp/grpcpp.h>
+#include <grpc/support/cpu.h>
 #include <grpc/support/log.h>
 
 #ifdef BAZEL_BUILD
@@ -43,30 +46,51 @@ using helloworld::Greeter;
 class ServerImpl final {
  public:
   ~ServerImpl() {
+    std::cout << "Shutting down the server ..." << std::endl;
+
     server_->Shutdown();
     // Always shutdown the completion queue after the server.
-    cq_->Shutdown();
+    for (auto& cq : cqs_) {
+      cq->Shutdown();
+    }
+    for (auto& thread : threads_) {
+      thread.join();
+    }
+    // Drain leftover notifications.
+    for (auto& cq : cqs_) {
+      bool ignored_ok;
+      void* ignored_tag;
+      while (cq->Next(&ignored_tag, &ignored_ok)) {}
+    }
   }
 
   // There is no shutdown handling in this code.
   void Run() {
     std::string server_address("0.0.0.0:50051");
-
     ServerBuilder builder;
     // Listen on the given address without any authentication mechanism.
     builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
     // Register "service_" as the instance through which we'll communicate with
     // clients. In this case it corresponds to an *asynchronous* service.
     builder.RegisterService(&service_);
-    // Get hold of the completion queue used for the asynchronous communication
-    // with the gRPC runtime.
-    cq_ = builder.AddCompletionQueue();
+    // Based on grpc/doc/cpp/perf_notes.md for best performance, we will create
+    // numcpu's threads and one completion queue per thread.
+    //
+    // For dependency, we must create completion queue ahead of the corresponding
+    // thread.
+    std::cout << "Number of CPU cores: " << gpr_cpu_num_cores() << std::endl;
+    for (int i = 0; i < gpr_cpu_num_cores(); i++) {
+      // Get hold of the completion queue used for the asynchronous communication
+      // with the gRPC runtime.
+      cqs_.emplace_back(builder.AddCompletionQueue());
+    }
     // Finally assemble the server.
     server_ = builder.BuildAndStart();
     std::cout << "Server listening on " << server_address << std::endl;
 
-    // Proceed to the server's main loop.
-    HandleRpcs();
+    for (int i = 0; i < gpr_cpu_num_cores(); i++) {
+      threads_.emplace_back(&ServerImpl::HandleRpcs, this, i);
+    }
   }
 
  private:
@@ -141,9 +165,10 @@ class ServerImpl final {
   };
 
   // This can be run in multiple threads if needed.
-  void HandleRpcs() {
+  void HandleRpcs(int thread_index) {
+    ServerCompletionQueue* cq = cqs_[thread_index].get();
     // Spawn a new CallData instance to serve new clients.
-    new CallData(&service_, cq_.get());
+    new CallData(&service_, cq);
     void* tag;  // uniquely identifies a request.
     bool ok;
     while (true) {
@@ -152,13 +177,14 @@ class ServerImpl final {
       // memory address of a CallData instance.
       // The return value of Next should always be checked. This return value
       // tells us whether there is any kind of event or cq_ is shutting down.
-      GPR_ASSERT(cq_->Next(&tag, &ok));
+      GPR_ASSERT(cq->Next(&tag, &ok));
       GPR_ASSERT(ok);
       static_cast<CallData*>(tag)->Proceed();
     }
   }
 
-  std::unique_ptr<ServerCompletionQueue> cq_;
+  std::vector<std::thread> threads_;
+  std::vector<std::unique_ptr<ServerCompletionQueue>> cqs_;
   Greeter::AsyncService service_;
   std::unique_ptr<Server> server_;
 };
@@ -167,5 +193,7 @@ int main(int argc, char** argv) {
   ServerImpl server;
   server.Run();
 
+  // TODO: need an elegant way for exit.
+  getchar();
   return 0;
 }
